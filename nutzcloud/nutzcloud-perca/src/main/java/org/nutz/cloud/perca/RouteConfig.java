@@ -1,10 +1,13 @@
 package org.nutz.cloud.perca;
 
+import java.util.Collections;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.concurrent.Executor;
 
 import org.nutz.boot.AppContext;
+import org.nutz.boot.starter.nacos.ConfigListener;
+import org.nutz.boot.starter.nacos.NacosConfigureLoader;
 import org.nutz.ioc.Ioc;
 import org.nutz.ioc.impl.PropertiesProxy;
 import org.nutz.ioc.loader.annotation.Inject;
@@ -48,6 +51,7 @@ public class RouteConfig {
             }
         }
         log.debugf("master count=%d", masters.size());
+        Collections.sort(masters);
         List<RouterMaster> oldMasters = this.masters;
         this.masters = masters;
         if (oldMasters != null && oldMasters.size() > 0) {
@@ -59,25 +63,16 @@ public class RouteConfig {
     
     public void init() throws Exception {
     	reload();
-    	if (ioc.has("nacosConfigService")) {
-    		ConfigService cs = ioc.get(ConfigService.class, "nacosConfigService");
-    		cs.addListener(conf.check("nacos.config.data-id"), conf.get("nacos.config.group", Constants.DEFAULT_GROUP), new Listener() {
-				
-				@Override
-				public void receiveConfigInfo(String configInfo) {
-					try {
-						reload();
-					} catch (Exception e) {
-						log.error("fail to reload config!!!", e);
-					}
-				}
-				
-				@Override
-				public Executor getExecutor() {
-					return null;
-				}
-			});
-    	}
+    	if(ioc.has("nacosConfigureLoader")) {
+            NacosConfigureLoader nacosConfigureLoader = ioc.get(NacosConfigureLoader.class);
+            nacosConfigureLoader.addConfigListener(() -> {
+                try {
+                    reload();
+                } catch (Exception e) {
+                    log.error("fail to reload config!!!", e);
+                }
+            });
+        }
     }
     
     

@@ -6,11 +6,7 @@ import java.util.List;
 import java.util.regex.Pattern;
 
 import org.nutz.boot.AppContext;
-import org.nutz.cloud.perca.impl.LoachServerSelectorFilter;
-import org.nutz.cloud.perca.impl.NacosServerPrefixSelectorFilter;
-import org.nutz.cloud.perca.impl.NacosServerSelectorFilter;
-import org.nutz.cloud.perca.impl.SimpleRouteFilter;
-import org.nutz.cloud.perca.impl.TargetServerInfo;
+import org.nutz.cloud.perca.impl.*;
 import org.nutz.ioc.Ioc;
 import org.nutz.ioc.impl.PropertiesProxy;
 import org.nutz.lang.Strings;
@@ -75,8 +71,16 @@ public class RouterMaster implements Comparable<RouterMaster> {
 	}
 	
 	public void preRoute(RouteContext ctx) throws IOException {
+		ctx.rmaster = this;
 		for (RouteFilter filter : filters) {
 			filter.preRoute(ctx);
+		}
+	}
+	
+	public void postRoute(RouteContext ctx) throws IOException {
+		ctx.rmaster = this;
+		for (RouteFilter filter : filters) {
+			filter.postRoute(ctx);
 		}
 	}
 
@@ -124,6 +128,15 @@ public class RouterMaster implements Comparable<RouterMaster> {
     		case "nacos-prefix":
     			filter = new NacosServerPrefixSelectorFilter();
     			break;
+    		case "sentinel":
+    			filter = new SentinelFilter();
+    			break;
+    		case "hide-real-url":
+				filter = new HideRealUrlFilter();
+				break;
+				case "rewrite-url":
+					filter = new RewriteUrlFilter();
+					break;
     		default:
     			// 可能是类名
     			if (type.indexOf('.') > 0) 

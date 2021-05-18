@@ -14,16 +14,14 @@ import javax.sql.DataSource;
 import javax.websocket.server.ServerContainer;
 import javax.websocket.server.ServerEndpoint;
 
-import org.eclipse.jetty.server.HttpConfiguration;
-import org.eclipse.jetty.server.HttpConnectionFactory;
-import org.eclipse.jetty.server.Server;
-import org.eclipse.jetty.server.ServerConnector;
-import org.eclipse.jetty.server.SslConnectionFactory;
+import org.eclipse.jetty.server.*;
 import org.eclipse.jetty.server.handler.ErrorHandler;
 import org.eclipse.jetty.server.handler.gzip.GzipHandler;
 import org.eclipse.jetty.server.session.DatabaseAdaptor;
 import org.eclipse.jetty.server.session.DefaultSessionCache;
+import org.eclipse.jetty.server.session.DefaultSessionIdManager;
 import org.eclipse.jetty.server.session.FileSessionDataStoreFactory;
+import org.eclipse.jetty.server.session.HouseKeeper;
 import org.eclipse.jetty.server.session.JDBCSessionDataStoreFactory;
 import org.eclipse.jetty.server.session.SessionCache;
 import org.eclipse.jetty.server.session.SessionDataStore;
@@ -42,8 +40,10 @@ import org.nutz.boot.starter.MonitorObject;
 import org.nutz.boot.starter.ServerFace;
 import org.nutz.boot.starter.servlet3.AbstractServletContainerStarter;
 import org.nutz.boot.starter.servlet3.NbServletContextListener;
+import org.nutz.castor.Castors;
 import org.nutz.ioc.loader.annotation.IocBean;
 import org.nutz.lang.Lang;
+import org.nutz.lang.Nums;
 import org.nutz.lang.Strings;
 import org.nutz.log.Log;
 import org.nutz.log.Logs;
@@ -154,6 +154,9 @@ public class JettyStarter extends AbstractServletContainerStarter implements Ser
     @PropDoc(value = "session持久化,SessionDataStore对应的ioc名称", defaultValue = "jettySessionDataStore")
     public static final String PROP_SESSION_IOC_DATASTORE = PRE + "session.ioc.datastore";
     
+    @PropDoc(value = "扫描session过期的间隔", defaultValue = "600")
+    public static final String PROP_SESSION_SCAVENGE_TNTERVAL = "jetty.sessionScavengeInterval.seconds";
+    
     // Cookie相关
     @PropDoc(value = "cookie是否设置HttpOnly", defaultValue = "false")
     public static final String PROP_SESSION_COOKIE_HTTPONLY = PRE + "session.cookie.httponly";
@@ -169,6 +172,12 @@ public class JettyStarter extends AbstractServletContainerStarter implements Ser
     
     @PropDoc(value = "设置cookie的path")
     public static final String PROP_SESSION_COOKIE_PATH = PRE + "session.cookie.path";
+    
+    @PropDoc(value = "设置jetty的临时目录", defaultValue = "./temp")
+    public static final String PROP_TEMP_DIR = PRE + "tempdir";
+
+    @PropDoc(value = "配置多个端口监听", defaultValue = "")
+    public static final String PROP_EXT_PORTS = PRE + "extports";
 
     protected Server server;
     protected WebAppContext wac;
@@ -202,17 +211,35 @@ public class JettyStarter extends AbstractServletContainerStarter implements Ser
         threadPool.setMaxThreads(getMaxThreads());
         server = new Server(threadPool);
         // HTTP端口设置
-        HttpConfiguration httpConfig = conf.make(HttpConfiguration.class, "jetty.httpConfig.");
-        HttpConnectionFactory httpFactory = new HttpConnectionFactory(httpConfig);
-        connector = new ServerConnector(server, httpFactory);
-        connector.setHost(getHost());
-        connector.setPort(getPort());
-        connector.setIdleTimeout(getIdleTimeout());
-        server.addConnector(connector);
-
-        updateMonitorValue("http.port", connector.getPort());
-        updateMonitorValue("http.host", connector.getHost());
-        updateMonitorValue("http.idleTimeout", connector.getIdleTimeout());
+        if (conf.getBoolean("jetty.http.enable", true)) {
+            HttpConfiguration httpConfig = conf.make(HttpConfiguration.class, "jetty.httpConfig.");
+            HttpConnectionFactory httpFactory = new HttpConnectionFactory(httpConfig);
+            connector = new ServerConnector(server, httpFactory);
+            connector.setHost(getHost());
+            connector.setPort(getPort());
+            connector.setIdleTimeout(getIdleTimeout());
+            server.addConnector(connector);
+            // 配置多端口监听
+            if(conf.has(PROP_EXT_PORTS)) {
+                int[] ports = Nums.splitInt(conf.get(PROP_EXT_PORTS));
+                for (int port : ports) {
+                    log.debugf("jetty http add port: %s", port);
+                    ServerConnector extConnector = new ServerConnector(server, httpFactory);
+                    extConnector.setHost(getHost());
+                    extConnector.setPort(port);
+                    extConnector.setIdleTimeout(getIdleTimeout());
+                    server.addConnector(extConnector);
+                }
+            }
+            updateMonitorValue("http.enable", true);
+            updateMonitorValue("http.port", connector.getPort());
+            updateMonitorValue("http.host", connector.getHost());
+            updateMonitorValue("http.idleTimeout", connector.getIdleTimeout());
+        }
+        else {
+        	log.info("jetty http is disable");
+        	updateMonitorValue("http.enable", false);
+        }
 
         // 看看Https设置
         int httpsPort = conf.getInt(PROP_HTTPS_PORT);
@@ -267,7 +294,7 @@ public class JettyStarter extends AbstractServletContainerStarter implements Ser
         // wac.setCopyWebInf(true);
         // wac.setProtectedTargets(new String[]{"/java", "/javax", "/org",
         // "/net", "/WEB-INF", "/META-INF"});
-        wac.setTempDirectory(new File("temp"));
+        wac.setTempDirectory(new File(conf.get(PROP_TEMP_DIR, "temp")));
         wac.setClassLoader(classLoader);
         wac.setConfigurationDiscovered(true);
         if (System.getProperty("os.name").toLowerCase().contains("windows")) {
@@ -404,6 +431,21 @@ public class JettyStarter extends AbstractServletContainerStarter implements Ser
                 break;
             }
             handler.setSessionCache(sessionCache);
+        }
+        if (conf.getInt("jetty.sessionScavengeInterval.seconds") > 0) {
+
+            SessionIdManager sessionIdManager = sessionHandler.getSessionIdManager();
+            if (sessionIdManager == null) {
+            	sessionIdManager = new DefaultSessionIdManager(server);
+            	sessionHandler.setSessionIdManager(sessionIdManager);
+            }
+            HouseKeeper keeper = sessionIdManager.getSessionHouseKeeper();
+            if (keeper == null) {
+            	keeper = new HouseKeeper();
+            	sessionIdManager.setSessionHouseKeeper(keeper);
+            }
+            keeper.setIntervalSec(conf.getInt("jetty.sessionScavengeInterval.seconds"));
+            server.addBean(keeper, true);
         }
     }
 

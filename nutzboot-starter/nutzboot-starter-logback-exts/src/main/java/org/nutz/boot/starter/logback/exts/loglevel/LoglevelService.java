@@ -2,20 +2,23 @@ package org.nutz.boot.starter.logback.exts.loglevel;
 
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.LoggerContext;
-import org.nutz.integration.jedis.RedisService;
+import org.nutz.integration.jedis.JedisAgent;
 import org.nutz.integration.jedis.pubsub.PubSub;
 import org.nutz.integration.jedis.pubsub.PubSubService;
 import org.nutz.ioc.loader.annotation.Inject;
 import org.nutz.ioc.loader.annotation.IocBean;
 import org.nutz.json.Json;
 import org.nutz.json.JsonFormat;
+import org.nutz.lang.Streams;
 import org.nutz.lang.Strings;
 import org.nutz.lang.util.NutMap;
 import org.nutz.log.Log;
 import org.nutz.log.Logs;
 import org.slf4j.LoggerFactory;
+import redis.clients.jedis.*;
 
-import java.util.Set;
+import java.util.ArrayList;
+import java.util.List;
 
 @IocBean(create = "init")
 public class LoglevelService implements PubSub {
@@ -23,7 +26,7 @@ public class LoglevelService implements PubSub {
     @Inject
     protected LoglevelProperty loglevelProperty;
     @Inject
-    protected RedisService redisService;
+    protected JedisAgent jedisAgent;
     @Inject
     protected PubSubService pubSubService;
     @Inject
@@ -33,7 +36,7 @@ public class LoglevelService implements PubSub {
      * 初始化数据到redis并订阅主题
      */
     public void init() {
-        pubSubService.reg(loglevelProperty.REDIS_KEY_PREFIX + "pubsub", this);
+        pubSubService.reg(loglevelProperty.getREDIS_KEY_PREFIX() + "pubsub", this);
         saveToRedis();
         doHeartbeat();
     }
@@ -55,7 +58,13 @@ public class LoglevelService implements PubSub {
         loglevelProperty.setVmUse(vmUse);
         loglevelProperty.setLoglevel(getLevel());
         //log.debug("LoglevelService saveToRedis::"+Json.toJson(loglevelProperty));
-        redisService.setex(loglevelProperty.REDIS_KEY_PREFIX + "list:" + loglevelProperty.getName() + ":" + loglevelProperty.getProcessId(), loglevelProperty.getKeepalive(), Json.toJson(loglevelProperty, JsonFormat.compact()));
+        Jedis jedis = null;
+        try {
+            jedis = jedisAgent.jedis();
+            jedis.setex(loglevelProperty.getREDIS_KEY_PREFIX() + "list:" + loglevelProperty.getName() + ":" + loglevelProperty.getProcessId(), loglevelProperty.getKeepalive(), Json.toJson(loglevelProperty, JsonFormat.compact()));
+        } finally {
+            Streams.safeClose(jedis);
+        }
     }
 
     /**
@@ -71,7 +80,7 @@ public class LoglevelService implements PubSub {
      * @param loglevelCommand
      */
     public void changeLoglevel(LoglevelCommand loglevelCommand) {
-        pubSubService.fire(loglevelProperty.REDIS_KEY_PREFIX + "pubsub", Json.toJson(loglevelCommand, JsonFormat.compact()));
+        pubSubService.fire(loglevelProperty.getREDIS_KEY_PREFIX() + "pubsub", Json.toJson(loglevelCommand, JsonFormat.compact()));
     }
 
     /**
@@ -150,13 +159,51 @@ public class LoglevelService implements PubSub {
      * @return
      */
     public NutMap getData() {
-        Set<String> set = redisService.keys(loglevelProperty.REDIS_KEY_PREFIX + "list:*");
         NutMap map = NutMap.NEW();
-        for (String key : set) {
-            String[] keys = key.split(":");
-            String name = keys[3];
-            LoglevelProperty loglevelProperty = Json.fromJson(LoglevelProperty.class, redisService.get(key));
-            map.addv2(name, loglevelProperty);
+        if (jedisAgent.isClusterMode()) {
+            JedisCluster jedisCluster = jedisAgent.getJedisClusterWrapper().getJedisCluster();
+            List<String> keys = new ArrayList<>();
+            for (JedisPool pool : jedisCluster.getClusterNodes().values()) {
+                try (Jedis jedis = pool.getResource()) {
+                    ScanParams match = new ScanParams().match(loglevelProperty.getREDIS_KEY_PREFIX() + "list:*");
+                    ScanResult<String> scan = null;
+                    do {
+                        scan = jedis.scan(scan == null ? ScanParams.SCAN_POINTER_START : scan.getStringCursor(), match);
+                        keys.addAll(scan.getResult());
+                    } while (!scan.isCompleteIteration());
+                }
+            }
+            Jedis jedis = null;
+            try {
+                jedis = jedisAgent.jedis();
+                for (String key : keys) {
+                    String[] tmp = key.split(":");
+                    String name = tmp[3];
+                    LoglevelProperty loglevelProperty = Json.fromJson(LoglevelProperty.class, jedis.get(key));
+                    map.addv2(name, loglevelProperty);
+                }
+            } finally {
+                Streams.safeClose(jedis);
+            }
+        } else {
+            Jedis jedis = null;
+            try {
+                jedis = jedisAgent.jedis();
+                ScanParams match = new ScanParams().match(loglevelProperty.getREDIS_KEY_PREFIX() + "list:*");
+                ScanResult<String> scan = null;
+                do {
+                    scan = jedis.scan(scan == null ? ScanParams.SCAN_POINTER_START : scan.getStringCursor(), match);
+                    for (String key : scan.getResult()) {
+                        String[] keys = key.split(":");
+                        String name = keys[3];
+                        LoglevelProperty loglevelProperty = Json.fromJson(LoglevelProperty.class, jedis.get(key));
+                        map.addv2(name, loglevelProperty);
+                    }
+                    // 已经迭代结束了
+                } while (!scan.isCompleteIteration());
+            } finally {
+                Streams.safeClose(jedis);
+            }
         }
         return map;
     }
